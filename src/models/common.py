@@ -17,8 +17,8 @@ class GaussianHeatmapGenerator(nn.Module):
         # Create coordinate grid once
         coords = torch.arange(heatmap_size, dtype=torch.float32)
         y_grid, x_grid = torch.meshgrid(coords, coords, indexing="ij")
-        self.register_buffer("x_grid", x_grid)
-        self.register_buffer("y_grid", y_grid)
+        self.register_buffer("x_grid", x_grid.clone())
+        self.register_buffer("y_grid", y_grid.clone())
 
     def forward(self, keypoints_2d):
         """

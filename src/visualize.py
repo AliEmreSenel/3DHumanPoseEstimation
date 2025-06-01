@@ -21,6 +21,13 @@ def visualize_3d_pose(joints_3d, title="3D Pose"):
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection="3d")
 
+    joints_3d[:, 0], joints_3d[:, 1], joints_3d[:, 2] = (
+        joints_3d[:, 0].copy(),
+        joints_3d[:, 2].copy(),
+        -joints_3d[:, 1].copy(),
+    )
+
+
     # Check for NaN/Inf values
     has_nan = np.isnan(joints_3d).any() or np.isinf(joints_3d).any()
     if not has_nan:

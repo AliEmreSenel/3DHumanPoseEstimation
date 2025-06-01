@@ -1,9 +1,34 @@
 import torch
 import torch.nn as nn
 from utils import get_activation
-from .common import GaussianHeatmapGenerator, PoseRegressionHead
+from .common import GaussianHeatmapGenerator
 import timm
 
+class PoseRegressionHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        num_joints,
+        hidden_dims=(512, 256),
+        dropout=0.2,
+        activation="gelu",
+    ):
+        super(PoseRegressionHead, self).__init__()
+        self.num_joints = num_joints
+        layers = []
+        prev_dim = in_features
+        for hidden_dim in hidden_dims:   
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(get_activation(activation))
+            layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim   
+        layers.append(nn.Linear(prev_dim, num_joints * 3))
+        self.decoder = nn.Sequential(*layers)
+
+    def forward(self, x):
+        pose = self.decoder(x)
+        pose = pose.view(-1, self.num_joints, 3)
+        return pose
 
 class PatchEmbedding(nn.Module):  # Used for Heatmaps
     def __init__(self, img_size_h, img_size_w, patch_size, in_chans, embed_dim):

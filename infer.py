@@ -9,17 +9,36 @@ import logging
 import matplotlib.pyplot as plt
 import io
 
-# Import from your project's modules
 from models.cnn import CNNPoseEstimation
 from models.transformers import TransformerPoseEstimation
 from model_config import ModelConfig
 
-from visualize import visualize_3d_pose, fig_to_image, CONNECTIONS
+from visualize import visualize_3d_pose, fig_to_image
 from config import DEVICE, NUM_JOINTS as MODEL_NUM_JOINTS
 
-# For preprocessing (Using models from preprocess.py)
 from ultralytics import YOLO
 from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
+
+CONNECTIONS = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (0, 5),
+    (0, 6),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+    (5, 6),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
+]
 
 # Basic logging configuration
 logging.basicConfig(
@@ -27,9 +46,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Inference")
 
-# Define the expected input size for the model
-MODEL_INPUT_SIZE = (500, 500)
-VIZ_THUMBNAIL_SIZE = (400, 400)  # Size for each panel in the combined viz
+# Suppress ultralytics logs, similar to preprocess.py
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
+VIZ_THUMBNAIL_SIZE = (500, 500)  # Size for each panel in the combined viz
+MODEL_INPUT_SIZE = (
+    500,
+    500,
+)  # Default input size for the model, can be overridden by model config
 
 # Define transformations for the input image
 image_transform = transforms.Compose(
@@ -46,19 +70,39 @@ depth_transform = transforms.Compose(
 )
 
 
-def load_pose_model(checkpoint_path, num_joints=MODEL_NUM_JOINTS):
+def load_pose_model(checkpoint_path, model_type, num_joints=MODEL_NUM_JOINTS):
     """Loads the pre-trained 3D pose estimation model."""
+    global MODEL_INPUT_SIZE
     logger.info(f"Loading 3D pose model from: {checkpoint_path}")
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-        model_type = checkpoint.get("model_type", "cnn").lower()
+        model_type = checkpoint.get("model_type", model_type)
         model_args = checkpoint.get("model_args", {})
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
 
-        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        # Determine the actual state dictionary
+        actual_model_state_dict = checkpoint.get("model_state_dict")
+        if actual_model_state_dict is None:
+            # If 'model_state_dict' key is missing, assume the checkpoint IS the state_dict
+            actual_model_state_dict = checkpoint
+            if not isinstance(actual_model_state_dict, dict):
+                # Ensure it's a dictionary; otherwise, the format is unexpected.
+                raise ValueError(
+                    "Checkpoint file does not appear to be a valid state_dict or contain a 'model_state_dict' key."
+                )
+
+        # Remove "module." prefix which is often added by DataParallel or DDP
+        final_state_dict = {
+            k.replace("module.", ""): v for k, v in actual_model_state_dict.items()
+        }
 
         model_cfg = ModelConfig(model_type=model_type, **model_args)
+
+        MODEL_INPUT_SIZE = model_cfg.image_size
+
+        image_transform.transforms[0] = transforms.Resize(MODEL_INPUT_SIZE)
+        depth_transform.transforms[0] = transforms.Resize(MODEL_INPUT_SIZE)
+
         if model_type == "transformer":
             pose_model = TransformerPoseEstimation(config=model_cfg)
         elif model_type == "cnn":
@@ -66,7 +110,13 @@ def load_pose_model(checkpoint_path, num_joints=MODEL_NUM_JOINTS):
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
-        pose_model.load_state_dict(new_state_dict)
+        try:
+            pose_model.load_state_dict(final_state_dict, strict=True)
+        except RuntimeError as e:
+            logger.warning(
+                f"Failed to load state_dict strictly (error: {e}). Trying with strict=False."
+            )
+            pose_model.load_state_dict(final_state_dict, strict=False)
 
         logger.info("3D Pose Model loaded successfully.")
     except FileNotFoundError:
@@ -85,8 +135,9 @@ def load_preprocessing_models(yolo_path):
     """Loads YOLO and DepthPro models."""
     logger.info("Loading preprocessing models (YOLO and DepthPro)...")
     try:
-        yolo_model = YOLO(yolo_path)
-        # yolo_model.to(DEVICE) # YOLO model handles device internally based on input
+        yolo_model = YOLO(
+            yolo_path
+        )  # verbose=False is handled in the call to yolo_model
         logger.info(f"YOLO pose model loaded from {yolo_path}.")
         depth_processor = DepthProImageProcessorFast.from_pretrained(
             "apple/DepthPro-hf"
@@ -104,109 +155,120 @@ def load_preprocessing_models(yolo_path):
 
 def get_2d_keypoints(yolo_model, image_pil, confidence_threshold=0.3):
     """
-    Estimates 2D keypoints using the YOLO model.
+    Estimates 2D keypoints using the YOLO model, using .xy and .conf attributes.
     Returns a tensor of shape (1, MODEL_NUM_JOINTS, 3) with (norm_x, norm_y, confidence).
     Padded/truncated to MODEL_NUM_JOINTS. Invalid/padded keypoints have conf=0.
     """
-    # YOLO model runs on CPU or GPU based on its own setup or input tensor device
-    # Forcing device here for results if yolo_model itself doesn't handle it well with PIL/numpy inputs
     results = yolo_model(image_pil, device=DEVICE, verbose=False)
-
     processed_persons_keypoints = []
-
     img_w, img_h = image_pil.size
 
     for res_idx, res in enumerate(results):
-        if res.keypoints is None or len(res.keypoints.data) == 0:
+        if res.keypoints is None:
             continue
 
-        # res.keypoints.data for Ultralytics YOLO is typically (num_persons, num_keypoints_yolo, 3) -> x, y, conf
-        # If single image and single person, it might be (num_keypoints_yolo, 3)
+        kpts_xy = res.keypoints.xy  # Pixel coordinates
+        kpts_conf = res.keypoints.conf  # Confidences
 
-        keypoints_data_for_image = res.keypoints.data.to(
-            DEVICE
-        )  # Ensure tensor is on the correct device
+        if (
+            kpts_xy is None
+            or kpts_conf is None
+            or kpts_xy.nelement() == 0
+            or kpts_conf.nelement() == 0
+        ):
+            continue
 
-        # Handle if keypoints_data_for_image is (num_kpts, 3) vs (num_persons, num_kpts, 3)
-        if keypoints_data_for_image.ndim == 2:  # Single person detected, add batch dim
-            keypoints_data_for_image = keypoints_data_for_image.unsqueeze(0)
+        kpts_xy = kpts_xy.to(DEVICE)
+        kpts_conf = kpts_conf.to(DEVICE)
 
-        for person_idx in range(keypoints_data_for_image.shape[0]):
-            kpts_tensor = keypoints_data_for_image[
-                person_idx
-            ]  # Shape: (num_keypoints_yolo, 3) [x, y, conf]
+        if kpts_xy.ndim == 2:
+            kpts_xy = kpts_xy.unsqueeze(0)
+        if kpts_conf.ndim == 1:
+            kpts_conf = kpts_conf.unsqueeze(0)
+
+        if (
+            kpts_xy.shape[0] != kpts_conf.shape[0]
+            or kpts_xy.shape[1] != kpts_conf.shape[1]
+        ):
+            logger.warning(
+                f"Shape mismatch between keypoints xy ({kpts_xy.shape}) and conf ({kpts_conf.shape}). Skipping person."
+            )
+            continue
+
+        num_persons = kpts_xy.shape[0]
+
+        for person_idx in range(num_persons):
+            person_xy_tensor = kpts_xy[person_idx]
+            person_conf_tensor = kpts_conf[person_idx]
 
             person_result_kpts_with_conf = torch.zeros(
                 (MODEL_NUM_JOINTS, 3), device=DEVICE
-            )  # norm_x, norm_y, conf
+            )
 
-            num_detected_kpts_yolo = kpts_tensor.shape[0]
-
+            num_detected_kpts_yolo = person_xy_tensor.shape[0]
             valid_kpt_idx = 0
             for yolo_kpt_idx in range(num_detected_kpts_yolo):
                 if valid_kpt_idx >= MODEL_NUM_JOINTS:
-                    break  # Filled all target joint slots
+                    break
 
-                x_pixel, y_pixel, conf = kpts_tensor[yolo_kpt_idx]
+                x_pixel, y_pixel = person_xy_tensor[yolo_kpt_idx]
+                conf = person_conf_tensor[yolo_kpt_idx]
 
-                if conf >= confidence_threshold:
-                    norm_x = x_pixel / img_w
-                    norm_y = y_pixel / img_h
-                    person_result_kpts_with_conf[valid_kpt_idx, 0] = norm_x
-                    person_result_kpts_with_conf[valid_kpt_idx, 1] = norm_y
-                    person_result_kpts_with_conf[valid_kpt_idx, 2] = conf
-                    valid_kpt_idx += 1
+                norm_x = x_pixel / img_w
+                norm_y = y_pixel / img_h
+                person_result_kpts_with_conf[valid_kpt_idx, 0] = norm_x
+                person_result_kpts_with_conf[valid_kpt_idx, 1] = norm_y
+                person_result_kpts_with_conf[valid_kpt_idx, 2] = conf
+                valid_kpt_idx += 1
 
             processed_persons_keypoints.append(person_result_kpts_with_conf)
-            # For this script, we only take the first person with valid keypoints
-            if processed_persons_keypoints:  # Take the first person processed
+            if processed_persons_keypoints:  # Take the first valid person
                 return processed_persons_keypoints[0].unsqueeze(0).to(DEVICE)
 
     if not processed_persons_keypoints:
         logger.warning(
-            "No 2D keypoints detected or none passed the confidence threshold."
+            "No 2D keypoints detected or none passed the confidence threshold for any person."
         )
         return torch.zeros(
-            (1, MODEL_NUM_JOINTS, 3), device=DEVICE
-        )  # Return zeroed (norm_x, norm_y, conf=0)
+            (1, MODEL_NUM_JOINTS, 3), device=DEVICE  # Return zeroed tensor
+        )
 
-    # Should have returned within the loop for the first person
-    # Fallback, though ideally not reached if logic above is correct
+    # Should have returned in the loop if a person was processed
     return processed_persons_keypoints[0].unsqueeze(0).to(DEVICE)
 
 
 def get_depth_map(depth_processor, depth_model, image_pil):
-    """Estimates depth map using DepthPro."""
+    """Estimates depth map using DepthPro. Output is normalized to [0,1]."""
     img_w, img_h = image_pil.size
     inputs = depth_processor(images=image_pil, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         outputs = depth_model(**inputs)
+    # Post-process to get the depth map, typically in a relative scale
     post_processed = depth_processor.post_process_depth_estimation(
-        outputs, target_sizes=[(img_h, img_w)]
+        outputs, target_sizes=[(img_h, img_w)]  # Ensure original image dimensions
     )
-    depth_tensor = post_processed[0]["predicted_depth"]
-    dmin, dmax = depth_tensor.min(), depth_tensor.max()
-    depth_normalized = (
-        (depth_tensor - dmin) / (dmax - dmin)
-        if dmax > dmin
-        else torch.zeros_like(depth_tensor)
-    )
-    return depth_normalized.unsqueeze(0).unsqueeze(0).to(DEVICE)
+    depth_tensor = post_processed[0]["predicted_depth"]  # This is [H, W]
+
+    return depth_tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
 
 
-def create_depth_viz(depth_tensor):
-    """Creates a colored PIL image from a depth tensor."""
-    depth_numpy = depth_tensor.squeeze().cpu().numpy()
-    plt.figure(figsize=(5, 5))
-    plt.imshow(depth_numpy, cmap="viridis")
-    plt.axis("off")
-    plt.tight_layout(pad=0)
-    buf = io.BytesIO()
+def create_depth_viz(depth_tensor_normalized_0_1):
+    """Creates a colored PIL image from a depth tensor"""
+    # Squeeze batch and channel dimensions, convert to numpy
+    depth_numpy = depth_tensor_normalized_0_1.squeeze().cpu().numpy()
+
+    plt.figure(figsize=(5, 5))  # Matplotlib figure for visualization
+    plt.imshow(depth_numpy, cmap="viridis")  # Use a colormap
+    plt.axis("off")  # No axes for a clean image
+    plt.tight_layout(pad=0)  # Remove padding
+
+    buf = io.BytesIO()  # In-memory buffer
     plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
     buf.seek(0)
-    depth_pil = Image.open(buf)
-    plt.close()
-    depth_pil.thumbnail(VIZ_THUMBNAIL_SIZE)
+    depth_pil = Image.open(buf)  # Create PIL image from buffer
+    plt.close()  # Close the figure to free memory
+
+    depth_pil.thumbnail(VIZ_THUMBNAIL_SIZE)  # Resize for consistent viz panel size
     return depth_pil
 
 
@@ -218,33 +280,32 @@ def create_2d_kpts_viz(image_pil, keypoints_normalized_with_conf):
     img_cv2 = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     h, w = img_cv2.shape[:2]
 
-    kpts_data = (
-        keypoints_normalized_with_conf.squeeze(0).cpu().numpy()
-    )  # Shape [MODEL_NUM_JOINTS, 3]
+    # Squeeze batch dimension, convert to numpy: Shape [MODEL_NUM_JOINTS, 3]
+    kpts_data = keypoints_normalized_with_conf.squeeze(0).cpu().numpy()
 
-    # Denormalize x, y coordinates
+    # Denormalize x, y coordinates to pixel values
     kpts_pixels = np.zeros((kpts_data.shape[0], 2), dtype=int)
     kpts_pixels[:, 0] = (kpts_data[:, 0] * w).astype(int)
     kpts_pixels[:, 1] = (kpts_data[:, 1] * h).astype(int)
-
     confidences = kpts_data[:, 2]
 
     # Draw keypoints
     for i in range(len(kpts_pixels)):
         conf = confidences[i]
-        if (
-            conf > 0
-        ):  # Draw only if confidence is greater than 0 (i.e., it passed threshold and is not padding)
+        if conf > 0:  # Draw only if confidence is positive (valid keypoint)
             x, y = kpts_pixels[i, 0], kpts_pixels[i, 1]
             cv2.circle(img_cv2, (x, y), 5, (0, 0, 255), -1)  # Red dots
 
-    # Draw connections
+    # Draw connections (bones)
+    # CONNECTIONS is assumed to be a list of tuples (start_idx, end_idx)
+    # defined according to MODEL_NUM_JOINTS indexing
     for start_idx, end_idx in CONNECTIONS:
+        # Ensure indices are within bounds for the current keypoints array
         if start_idx < len(kpts_pixels) and end_idx < len(kpts_pixels):
             start_conf = confidences[start_idx]
             end_conf = confidences[end_idx]
 
-            # Draw line only if both connected keypoints are valid (had conf > 0)
+            # Draw line only if both connected keypoints are valid
             if start_conf > 0 and end_conf > 0:
                 start_point = tuple(kpts_pixels[start_idx])
                 end_point = tuple(kpts_pixels[end_idx])
@@ -262,49 +323,56 @@ def preprocess_input(
     Preprocesses a single image.
     Returns:
         transformed_image: Tensor for the 3D model's image input.
-        transformed_depth: Tensor for the 3D model's depth input.
-        keypoints_2d_for_model: Tensor (Batch, MODEL_NUM_JOINTS, 2) for 3D model's keypoint input (norm_x, norm_y).
+        transformed_depth: Tensor for the 3D model's depth input (normalized [0,1] and resized).
+        keypoints_2d_for_model: Tensor (Batch, MODEL_NUM_JOINTS, 2) for 3D model (norm_x, norm_y).
         keypoints_2d_for_viz: Tensor (Batch, MODEL_NUM_JOINTS, 3) for visualization (norm_x, norm_y, conf).
-        depth_map_raw: Raw depth map for visualization.
+        depth_map_for_viz: Raw depth map (normalized [0,1], original size) for visualization.
     """
     try:
-        # keypoints_2d_with_conf shape: (1, MODEL_NUM_JOINTS, 3) -> (norm_x, norm_y, conf)
         keypoints_2d_with_conf = get_2d_keypoints(
             yolo_model, image_pil.copy(), confidence_threshold=yolo_conf_thresh
         )
 
         if (
             keypoints_2d_with_conf is None
-        ):  # Should not happen due to get_2d_keypoints returning zeros
+        ):  # Should not happen with current get_2d_keypoints
             logger.error("get_2d_keypoints returned None, which is unexpected.")
             return None, None, None, None, None
 
-        # Check if any keypoints were actually found (any confidence > 0)
-        if not torch.any(keypoints_2d_with_conf[:, :, 2] > 0):
-            logger.warning("No keypoints passed the threshold during preprocessing.")
+        if not torch.any(
+            keypoints_2d_with_conf[:, :, 2] > 0
+        ):  # Check if any valid kpts found
+            logger.warning(
+                "No keypoints passed the threshold during 2D pose estimation."
+            )
+            # Continue processing, model might handle zeroed keypoints.
 
-        # Keypoints for the model (x, y only)
-        keypoints_2d_for_model = keypoints_2d_with_conf[
-            :, :, :2
-        ].clone()  # Shape: (1, MODEL_NUM_JOINTS, 2)
+        keypoints_2d_for_model = keypoints_2d_with_conf[:, :, :2].clone()
 
-        depth_map_raw = get_depth_map(depth_processor, depth_model, image_pil.copy())
-        if depth_map_raw is None:
+        # depth_map_for_viz is normalized [0,1] and at original image resolution (but B,C,H,W)
+        depth_map_for_viz = get_depth_map(
+            depth_processor, depth_model, image_pil.copy()
+        )
+        if depth_map_for_viz is None:  # Should not happen
+            logger.error("get_depth_map returned None, which is unexpected.")
             return None, None, None, None, None
 
         transformed_image = image_transform(image_pil.copy()).unsqueeze(0).to(DEVICE)
-        # Ensure depth_map_raw is [B, C, H, W] before interpolate if it's not already
-        # get_depth_map returns [1, 1, H, W] which is correct
+
+        # transformed_depth is the [0,1] normalized depth map, resized to model input size
         transformed_depth = torch.nn.functional.interpolate(
-            depth_map_raw, size=MODEL_INPUT_SIZE, mode="bilinear", align_corners=False
+            depth_map_for_viz,
+            size=MODEL_INPUT_SIZE,
+            mode="bilinear",
+            align_corners=False,
         ).to(DEVICE)
 
         return (
             transformed_image,
             transformed_depth,
             keypoints_2d_for_model,
-            keypoints_2d_with_conf,
-            depth_map_raw,
+            keypoints_2d_with_conf,  # For 2D kpts visualization
+            depth_map_for_viz,  # For depth map visualization
         )
 
     except Exception as e:
@@ -316,23 +384,23 @@ def run_inference(pose_model, image_tensor, depth_tensor, keypoints_2d_tensor):
     """Runs inference. keypoints_2d_tensor is (Batch, NumJoints, 2)"""
     try:
         with torch.no_grad():
-            # keypoints_2d_tensor should be (Batch, NumJoints, 2) for the model
             predicted_joints_3d_batch = pose_model(
                 image_tensor, depth_tensor, keypoints_2d_tensor
             )
-        return predicted_joints_3d_batch[0].cpu().numpy()
+        return predicted_joints_3d_batch[0].cpu().numpy()  # Return first item in batch
     except Exception as e:
         logger.error(f"Error during model inference: {e}", exc_info=True)
         return None
 
 
 def main(args):
-    """Main inference loop with enhanced visualization."""
     output_path = Path(args.output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
     try:
-        pose_3d_model = load_pose_model(args.checkpoint_path, args.num_joints)
+        pose_3d_model = load_pose_model(
+            args.checkpoint_path, args.model_type, args.num_joints
+        )
         yolo_model, depth_processor, depth_model = load_preprocessing_models(
             args.yolo_model_path
         )
@@ -341,11 +409,13 @@ def main(args):
         return
 
     input_folder_path = Path(args.input_folder)
-    image_files = [
-        f
-        for f in input_folder_path.iterdir()
-        if f.is_file() and f.suffix.lower() in [".png", ".jpg", ".jpeg"]
-    ]
+    image_files = sorted(
+        [
+            f
+            for f in input_folder_path.iterdir()
+            if f.is_file() and f.suffix.lower() in [".png", ".jpg", ".jpeg"]
+        ]
+    )
 
     if not image_files:
         logger.warning(f"No images found in {args.input_folder}")
@@ -359,7 +429,6 @@ def main(args):
             logger.error(f"Could not open image {image_file_path.name}: {e}")
             continue
 
-        # Unpack the 5 return values from preprocess_input
         processed_data = preprocess_input(
             img_pil,
             yolo_model,
@@ -368,9 +437,7 @@ def main(args):
             yolo_conf_thresh=args.yolo_confidence_threshold,
         )
 
-        if (
-            processed_data[0] is None
-        ):  # Check based on first element, assuming all are None on failure
+        if processed_data[0] is None:  # Check if preprocessing failed
             logger.warning(
                 f"Skipping {image_file_path.name} due to preprocessing failure."
             )
@@ -378,14 +445,14 @@ def main(args):
 
         (
             image_tensor,
-            depth_tensor,
+            depth_tensor_for_model,  # Renamed for clarity
             keypoints_2d_for_model,
             keypoints_2d_for_viz,
-            depth_raw_for_viz,
+            depth_map_for_viz,  # Renamed for clarity
         ) = processed_data
 
         predicted_joints = run_inference(
-            pose_3d_model, image_tensor, depth_tensor, keypoints_2d_for_model
+            pose_3d_model, image_tensor, depth_tensor_for_model, keypoints_2d_for_model
         )
 
         if predicted_joints is None:
@@ -398,30 +465,30 @@ def main(args):
 
         if args.visualize:
             try:
-                # 1. Original Image
                 img_orig_viz = img_pil.copy()
                 img_orig_viz.thumbnail(VIZ_THUMBNAIL_SIZE)
 
-                # 2. 2D Keypoints Image (use keypoints_2d_for_viz)
                 img_2d_viz = create_2d_kpts_viz(
                     img_pil.copy(), keypoints_2d_for_viz.clone()
                 )
 
-                # 3. Depth Map Image
-                img_depth_viz = create_depth_viz(depth_raw_for_viz.clone())
+                # Use the depth_map_for_viz (normalized [0,1], original aspect ratio)
+                img_depth_viz = create_depth_viz(depth_map_for_viz.clone())
 
-                # 4. 3D Pose Image
                 fig_3d = visualize_3d_pose(
                     predicted_joints.copy(), title="Predicted 3D Pose"
                 )
-                img_3d_viz = fig_to_image(fig_3d)
+                img_3d_viz = fig_to_image(
+                    fig_3d
+                )  # Converts matplotlib fig to PIL Image
                 img_3d_viz.thumbnail(VIZ_THUMBNAIL_SIZE)
-                plt.close(fig_3d)
+                plt.close(fig_3d)  # Close figure after converting
 
-                # 5. Create 2x2 Combined Image
-                w_thumb, h_thumb = VIZ_THUMBNAIL_SIZE  # Corrected variable name
+                w_thumb, h_thumb = VIZ_THUMBNAIL_SIZE
                 combined_img = Image.new(
-                    "RGB", (w_thumb * 2, h_thumb * 2), (255, 255, 255)
+                    "RGB",
+                    (w_thumb * 2, h_thumb * 2),
+                    (255, 255, 255),  # White background
                 )
                 combined_img.paste(img_orig_viz, (0, 0))
                 combined_img.paste(img_2d_viz, (w_thumb, 0))
@@ -436,7 +503,7 @@ def main(args):
 
             except Exception as e:
                 logger.error(
-                    f"Failed to visualize for {image_file_path.name}: {e}",
+                    f"Failed to create or save visualization for {image_file_path.name}: {e}",
                     exc_info=True,
                 )
 
@@ -468,17 +535,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--yolo_model_path",
         type=str,
-        default="yolov8n-pose.pt",
-        help="Path to the YOLO pose model (e.g., yolov8n-pose.pt).",
+        default="yolo11x-pose.pt",
+        help="Path to the YOLO pose model (e.g. yolo11x-pose.pt).",
     )
     parser.add_argument(
         "--num_joints",
         type=int,
-        default=MODEL_NUM_JOINTS,
-        help="Number of joints expected by the model.",
+        default=MODEL_NUM_JOINTS,  # From config.py
+        help="Number of joints expected by the 3D pose model.",
     )
     parser.add_argument(
         "--visualize", action="store_true", help="Enable saving of visualizations."
+    )
+    parser.add_argument(
+        "--model_type", type=str, help="Enable saving of visualizations."
     )
     parser.add_argument(
         "--yolo_confidence_threshold",
@@ -488,5 +558,4 @@ if __name__ == "__main__":
     )
 
     parsed_args = parser.parse_args()
-
     main(parsed_args)
