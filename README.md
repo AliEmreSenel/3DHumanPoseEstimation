@@ -355,7 +355,6 @@ Training progress is logged to TensorBoard.
 - Shows total loss, individual loss components (MSE, L1, inter-joint, root), and metrics (MPJPE, PA-MPJPE). Validation previews are also logged.
 
 [Validation Previews](images/VALIDATION.md)
-[Tensorboard Screenshots](images/TENSORBOARD.md)
 
 ## Running Inference (`infer.py`)
 
@@ -389,6 +388,8 @@ If `--visualize` is used, `infer.py` saves a 2x2 combined image:
 2.  2D Keypoints Overlay
 3.  Estimated Depth Map
 4.  Rendered 3D Pose
+
+[Inference Samples](images/INFERENCE.md)
 
 ## Core Components
 
