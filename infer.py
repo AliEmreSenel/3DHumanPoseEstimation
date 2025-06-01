@@ -527,6 +527,13 @@ if __name__ == "__main__":
         help="Folder containing input images.",
     )
     parser.add_argument(
+        "--model-type",
+        type=str,
+        required=True,
+        choices=["cnn", "transformer"],
+        help="Model type: 'cnn' or 'transformer'",
+    )
+    parser.add_argument(
         "--output_folder",
         type=str,
         default="inference_output",
@@ -546,9 +553,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--visualize", action="store_true", help="Enable saving of visualizations."
-    )
-    parser.add_argument(
-        "--model_type", type=str, help="Enable saving of visualizations."
     )
     parser.add_argument(
         "--yolo_confidence_threshold",

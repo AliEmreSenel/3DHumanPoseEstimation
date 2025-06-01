@@ -368,6 +368,7 @@ Performs 3D human pose estimation on a folder of images.
   ```bash
   python infer.py --checkpoint_path <path/to/3D_model.pth> \
                   --input_folder <path/to/input_images> \
+                  --model_type <cnn, transformer> \
                   [options]
   ```
 - **Example**:
