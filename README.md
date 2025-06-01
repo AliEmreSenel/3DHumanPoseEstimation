@@ -389,8 +389,6 @@ If `--visualize` is used, `infer.py` saves a 2x2 combined image:
 3.  Estimated Depth Map
 4.  Rendered 3D Pose
 
-[Inference Imagess](images/INFERENCE.md)
-
 ## Core Components
 
 ### Configuration Files
