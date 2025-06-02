@@ -6,44 +6,11 @@
 | :-----------: | :-----------------: | :--------------: | :--------: | :------------: |
 |    3194670    |       3224481       |     3200991      |  3218444   |    3221337     |
 
-## Table of Contents
-
-1.  [Overview](#overview)
-2.  [Features](#features)
-3.  [Project Structure](#project-structure)
-4.  [Setup and Installation](#setup-and-installation)
-    - [Prerequisites](#prerequisites)
-    - [Clone Repository](#clone-repository)
-    - [Conda Environment Setup](#conda-environment-setup)
-    - [Install Project in Editable Mode](#install-project-in-editable-mode)
-    - [Rclone Setup (for `dataset_split.py`)](#rclone-setup)
-    - [Download Pretrained Models (for Preprocessing and Inference)](#download-pretrained-models)
-    - [Dataset Preparation (Human3.6M)](#dataset-preparation)
-    - [Configure `src/config.py`](#configure-srcconfigpy)
-5.  [Dataset Processing Workflow](#dataset-processing-workflow)
-    - [0. Per-Frame Preprocessing (`preprocess.py`)](#0-per-frame-preprocessing-preprocesspy)
-    - [1. Initial Chunking (`dataset_chunker.py`)](#1-initial-chunking-dataset_chunkerpy)
-    - [2. Splitting and Remote Re-chunking (`dataset_split.py`)](#2-splitting-and-remote-re-chunking-dataset_splitpy)
-    - [3. Shuffling and Local Re-chunking (`dataset_rechunker.py`)](#3-shuffling-and-local-re-chunking-dataset_rechunkerpy)
-6.  [Training the Model (`main.py`)](#training-the-model-mainpy)
-    - [Configuration for Training](#configuration-for-training)
-    - [Running Training](#running-training)
-    - [TensorBoard Logging](#tensorboard-logging)
-7.  [Running Inference (`infer.py`)](#running-inference-inferpy)
-    - [Running Inference Script](#running-inference-script)
-    - [Visualization](#visualization)
-8.  [Core Components](#core-components)
-    - [Configuration Files](#configuration-files)
-    - [Models](#models)
-    - [Dataset Handling](#dataset-handling)
-    - [Loss Function](#loss-function)
-    - [Training Logic](#training-logic)
-    - [Utilities and Visualization](#utilities-and-visualization)
-    - [Data Augmentation](#data-augmentation)
-
 ## Overview
 
 This project implements a pipeline for 3D human pose estimation from RGB images. It includes scripts for dataset processing, model training (CNN and Transformer architectures), and inference. The project is designed for large datasets like Human3.6M, providing tools for preprocessing, chunking, filtering, and distributing data, which is necessary due to dataset size. Data management, especially for large intermediate datasets, can be handled using `rclone` with cloud storage providers like OneDrive.
+
+You can read the report at [report.pdf](report.pdf)
 
 ## Features
 
@@ -388,39 +355,3 @@ If `--visualize` is used, `infer.py` saves a 2x2 combined image:
 4.  Rendered 3D Pose
 
 [Inference Samples](images/INFERENCE.md)
-
-## Core Components
-
-### Configuration Files
-
-- **`src/config.py`**: Global settings (paths, hyperparameters, loss weights, augmentation flags). **Customize for your setup.**
-- **`src/model_config.py`**: `ModelConfig` dataclass for architecture parameters.
-
-### Models (`src/models/`)
-
-- **`common.py`**: `GaussianHeatmapGenerator`, `PoseRegressionHead`.
-- **`cnn.py`**: `CNNPoseEstimation` model.
-- **`transformers.py`**: `TransformerPoseEstimation` model.
-  Both main models take image, depth, and 2D keypoints as input.
-
-### Dataset Handling (`src/dataset/`)
-
-- **`chunked_dataset.py`**: `StreamingChunkedDataset` for loading from `.tar` chunks.
-- **`collator.py`**: `Human36MCollator` for batching samples.
-
-### Loss Function (`src/loss.py`)
-
-- **`ComprehensivePoseLoss`**: Combines MSE, L1, inter-joint distance, and absolute root joint losses. Weights configurable in `src/config.py`.
-
-### Training Logic (`src/train.py`)
-
-- **`train_model` function**: Manages training/validation loop, logging, checkpoints.
-
-### Utilities and Visualization
-
-- **`src/utils.py`**: Coordinate transformations, depth normalization, evaluation metrics (MPJPE, PA-MPJPE), model layer helpers.
-- **`src/visualize.py`**: `visualize_comparison` (for validation previews), `fig_to_image`.
-
-### Data Augmentation (`src/dataset/augmentation.py`)
-
-- **`PoseAugmentor`**: Applies transformations (flip, rotation, scale, translate, color jitter) to image, depth, 2D keypoints, and 3D joints.
