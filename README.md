@@ -45,8 +45,6 @@
 
 This project implements a pipeline for 3D human pose estimation from RGB images. It includes scripts for dataset processing, model training (CNN and Transformer architectures), and inference. The project is designed for large datasets like Human3.6M, providing tools for preprocessing, chunking, filtering, and distributing data, which is necessary due to dataset size. Data management, especially for large intermediate datasets, can be handled using `rclone` with cloud storage providers like OneDrive.
 
-This repository serves as a framework for a class project on 3D pose estimation.
-
 ## Features
 
 - **Dataset Processing**:
